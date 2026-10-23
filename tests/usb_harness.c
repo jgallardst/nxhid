@@ -9,8 +9,9 @@ static UsbState state;
 static Result state_error;
 static u64 now_ns;
 static u32 next_id;
-static unsigned writes, stalls;
+static unsigned writes, stalls, cancels;
 static bool suppress_completion, short_write, active;
+static u8 scratch[0x1000] __attribute__((aligned(0x1000)));
 static struct usb_control_setup setup;
 static struct usb_device_descriptor devices[5];
 static u8 configurations[5][64], input[8], control_in[64], led_output;
@@ -24,7 +25,12 @@ bool hosversionBefore(int major, int minor, int micro) {
 u64 armGetSystemTick(void) { return now_ns; }
 u64 armTicksToNs(u64 ticks) { return ticks; }
 void armDCacheFlush(void *buffer, size_t size) { (void)buffer; (void)size; }
-Result eventClear(Event *event) { event->signaled = false; return 0; }
+Result eventClear(Event *event) {
+    // Faithful to hardware: svcResetSignal on an unsignaled event fails.
+    if (!event->signaled) return KERNELRESULT(InvalidState);
+    event->signaled = false;
+    return 0;
+}
 Result eventWait(Event *event, u64 timeout) {
     if (event->error) return event->error;
     if (event->signaled) return 0;
@@ -119,6 +125,7 @@ Result usbDsEndpoint_PostBufferAsync(UsbDsEndpoint *ep, void *data, size_t size,
     if (suppress_completion) ep->CompletionEvent.signaled = false;
     return 0;
 }
+Result usbDsEndpoint_Cancel(UsbDsEndpoint *ep) { assert(ep == &endpoint); cancels++; return 0; }
 Result usbDsEndpoint_GetReportData(UsbDsEndpoint *ep, UsbDsReportData *out) {
     assert(ep == &endpoint); *out = key_report; return 0;
 }
@@ -126,7 +133,8 @@ Result usbDsEndpoint_GetReportData(UsbDsEndpoint *ep, UsbDsReportData *out) {
 static Result request(u8 type, u8 code, u16 value, u16 length) {
     setup = (struct usb_control_setup){type, code, value, 0, length};
     intf.SetupEvent.signaled = true;
-    return usb_keyboard_tick();
+    for (int i = 0; i < 16; i++) usb_keyboard_tick(); // Pump the async control stages.
+    return 0;
 }
 static void descriptors(void) {
     for (int speed = 2; speed <= 4; speed++) {
@@ -137,7 +145,7 @@ static void descriptors(void) {
         assert(config[4] == 1 && config[5] == 3 && config[6] == 1 && config[7] == 1);
         assert(config[10] == USB_DT_HID && config[15] == USB_DT_REPORT);
         assert(config[20] == 0x81 && config[21] == USB_TRANSFER_TYPE_INTERRUPT);
-        assert(config[22] == 8 && config[24] == (speed == 2 ? 10 : 7));
+        assert(config[22] == 8 && config[24] == (speed == 2 ? 1 : 4));
     }
     assert(devices[4].bMaxPacketSize0 == 9);
     assert(request(0x81, 6, USB_DT_REPORT << 8, 255) == 0);
@@ -145,7 +153,7 @@ static void descriptors(void) {
     assert(control_in[0] == 5 && control_in[control_size - 1] == 0xC0);
     assert(request(0x81, 6, USB_DT_REPORT << 8, 8) == 0);
     assert(control_size == 8);
-    assert(request(0x81, 6, USB_DT_REPORT << 8, 0) == 0 && stalls == 1);
+    assert(request(0x81, 6, USB_DT_REPORT << 8, 0) == 0 && stalls == 0);
 }
 static void controls(void) {
     led_output = 0xE7;
@@ -158,46 +166,88 @@ static void controls(void) {
     assert(request(0xA1, 2, 0, 1) == 0 && control_in[0] == 3);
     assert(request(0x21, 9, 0x0200, 4096) == 0 && stalls == 1);
     state = UsbState_Configured;
-    assert(usb_keyboard_tick() == 0);
+    assert(usb_keyboard_tick() == 0 && !usb_keyboard_ready()); // settle not elapsed
+    now_ns += 300000000;
+    assert(usb_keyboard_tick() == 0 && !usb_keyboard_ready()); // descriptor not fetched
+    assert(request(0x81, 6, USB_DT_REPORT << 8, 255) == 0);
+    assert(usb_keyboard_tick() == 0 && usb_keyboard_ready());
+    assert(!memcmp(input, (u8[8]){0}, 8));
     assert(usb_keyboard_write((u8[8]){2, 0, 4}) == 0);
     assert(request(0xA1, 1, 0x0100, 8) == 0 && control_in[0] == 2 && control_in[2] == 4);
     unsigned before = writes;
     now_ns += 12000000;
     assert(usb_keyboard_tick() == 0 && writes == before + 1);
-    state = UsbState_Detached;
-    assert(R_FAILED(usb_keyboard_tick()));
+    state = UsbState_Suspended; // Host suspend: session survives, host state kept.
+    assert(usb_keyboard_tick() == 0 && !usb_keyboard_ready());
+    assert(usb_keyboard_leds() == 7 && usb_keyboard_resets() == 0);
+    state = UsbState_Configured; // Resume settles again, descriptor still valid.
+    assert(usb_keyboard_tick() == 0 && !usb_keyboard_ready());
+    now_ns += 300000000;
+    assert(usb_keyboard_tick() == 0 && usb_keyboard_ready());
+    assert(!memcmp(input, (u8[8]){0}, 8));
+    state = UsbState_Detached; // Host reset or unplug: no fatal error, re-enumerate.
+    assert(usb_keyboard_tick() == 0 && !usb_keyboard_ready());
+    assert(usb_keyboard_resets() == 1 && usb_keyboard_leds() == 0);
     usb_keyboard_exit();
-    assert(usb_keyboard_init() == 0 && usb_keyboard_leds() == 0);
+    assert(usb_keyboard_init() == 0 && usb_keyboard_leds() == 0 && usb_keyboard_resets() == 0);
     state = UsbState_Configured;
     assert(usb_keyboard_tick() == 0);
+    assert(request(0x81, 6, USB_DT_REPORT << 8, 255) == 0); // Host re-fetches descriptor.
+    now_ns += 300000000;
+    assert(usb_keyboard_tick() == 0 && usb_keyboard_ready());
     assert(!memcmp(input, (u8[8]){0}, 8));
 }
 static void errors(void) {
     state_error = 900;
-    assert(usb_keyboard_tick() == 900);
+    assert(usb_keyboard_tick() == 0); // Service errors are soft; the session survives.
     assert(usb_keyboard_write((u8[8]){0}) == 900);
+    assert(usb_keyboard_errors() == 1 && usb_keyboard_last_error() == 900);
     state_error = 0;
-    intf.SetupEvent.error = 901;
-    assert(usb_keyboard_tick() == 901);
-    intf.SetupEvent.error = 0;
-    intf.CtrlInCompletionEvent.error = 902;
-    assert(request(0x81, 6, USB_DT_REPORT << 8, 8) == 902);
+    // A wedged control transfer stalls at the deadline; the session continues.
+    setup = (struct usb_control_setup){0x81, 6, USB_DT_REPORT << 8, 0, 8};
+    intf.SetupEvent.signaled = true;
+    assert(usb_keyboard_tick() == 0);
+    intf.CtrlInCompletionEvent.signaled = false; // Host never completes the data stage.
+    unsigned before = stalls;
+    now_ns += 1600000000;
+    assert(usb_keyboard_tick() == 0 && stalls == before + 1 && usb_keyboard_errors() == 2);
+    // A superseded completion (host aborted mid-transfer) is dropped silently.
+    setup = (struct usb_control_setup){0x81, 6, USB_DT_REPORT << 8, 0, 8};
+    intf.SetupEvent.signaled = true;
+    assert(usb_keyboard_tick() == 0); // Posts the IN data stage.
+    u32 stale;
+    usbDsInterface_CtrlInPostBufferAsync(&intf, scratch, 8, &stale); // Host aborted it.
+    before = stalls;
+    unsigned seen = usb_keyboard_errors();
+    assert(usb_keyboard_tick() == 0 && stalls == before && usb_keyboard_errors() == seen);
+    request(0x21, 11, 0, 0); // A fresh SETUP clears the abandoned transfer.
+    // Endpoint service failures fail the report, never the session.
     usb_keyboard_exit();
     assert(usb_keyboard_init() == 0);
     state = UsbState_Configured;
     endpoint.CompletionEvent.error = 903;
     assert(usb_keyboard_write((u8[8]){0}) == 903);
-    assert(now_ns == 0); // An IPC failure must not be retried as a timeout.
+    u64 frozen = now_ns; // An IPC failure must not be retried as a timeout.
     usb_keyboard_exit();
     assert(usb_keyboard_init() == 0);
-    short_write = true;
+    assert(now_ns == frozen);
+    short_write = true; // Short transfers fail the report, not the session.
     assert(R_FAILED(usb_keyboard_write((u8[8]){0})));
+    short_write = false;
     usb_keyboard_exit();
     assert(usb_keyboard_init() == 0);
-    short_write = false;
-    suppress_completion = true;
+    state = UsbState_Configured;
+    suppress_completion = true; // Host stops polling mid-transfer: cancel, not teardown.
     assert(usb_keyboard_write((u8[8]){0}) == KERNELRESULT(TimedOut));
-    assert(now_ns == 250000000);
+    assert(now_ns == frozen + 1500000000); // 1.5 s report deadline, 1 ms per poll.
+    assert(cancels == 1);
+    suppress_completion = false;
+    // Regression for hardware: after a cancelled transfer the completion event
+    // is unsignaled, and resetting it used to fail every subsequent write.
+    assert(usb_keyboard_write((u8[8]){0}) == 0);
+    endpoint.CompletionEvent.signaled = true; // Stale signal: drained, not reset.
+    assert(usb_keyboard_write((u8[8]){0}) == 0);
+    assert(usb_keyboard_write((u8[8]){0}) == 0);
 }
 int main(int argc, char **argv) {
     assert(argc == 2);

@@ -1,22 +1,86 @@
 #include <switch.h>
 #include <arpa/inet.h>
 #include <errno.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <string.h>
 #include <sys/socket.h>
 #include "server.h"
 #include "usb_keyboard.h"
 
-static Result usb_fault;
+#ifndef NXHID_VERSION
+#define NXHID_VERSION "dev"
+#endif
 
-static bool write_report(const uint8_t report[8]) {
-    // Never reuse a DMA buffer following a failed transfer before teardown.
-    if (R_FAILED(usb_fault)) return false;
-    usb_fault = usb_keyboard_write(report);
-    return R_SUCCEEDED(usb_fault);
-}
+static unsigned long seen_resets, seen_errors;
+static FILE *log_file;
+static u64 log_origin;
+static bool was_ready;
+static char last_event[96] = "events start";
 
 static u64 milliseconds(void) { return armTicksToNs(armGetSystemTick()) / 1000000; }
+
+// Every notable session and USB event lands in nxhid.log with a millisecond
+// timeline; failures on real hardware are diagnosed from this trace.
+static void log_line(const char *format, ...) {
+    if (!log_file) return;
+    fprintf(log_file, "[%8llu ms] ", (unsigned long long)(milliseconds() - log_origin));
+    va_list args;
+    va_start(args, format);
+    vfprintf(log_file, format, args);
+    va_end(args);
+    fputc('\n', log_file);
+    fflush(log_file);
+}
+
+static const char *usb_state_name(UsbState state) {
+    switch (state) {
+        case UsbState_Detached: return "detached";
+        case UsbState_Attached: return "attached";
+        case UsbState_Powered: return "powered";
+        case UsbState_Default: return "default";
+        case UsbState_Address: return "address";
+        case UsbState_Configured: return "configured";
+        case UsbState_Suspended: return "suspended";
+    }
+    return "?";
+}
+
+static void on_server_event(Server *s, ServerEvent event) {
+    const char *name;
+    switch (event) {
+        case ServerEventAccepted: name = "sender accepted"; break;
+        case ServerEventRejected: name = "sender rejected (busy)"; break;
+        case ServerEventDropPeer: name = "dropped: peer closed"; break;
+        case ServerEventDropSend: name = "dropped: send failed"; break;
+        case ServerEventDropIdle: name = "dropped: heartbeat timeout"; break;
+        case ServerEventDropPause: name = "dropped: USB paused too long"; break;
+        case ServerEventDropRetry: name = "dropped: report undeliverable"; break;
+        case ServerEventDropInvalid: name = "dropped: invalid input"; break;
+        case ServerEventReportHeld: name = "report held for retry"; break;
+        case ServerEventReportSent: name = "report delivered"; break;
+        default: name = "?"; break;
+    }
+    snprintf(last_event, sizeof(last_event), "%s", name);
+    if (event == ServerEventAccepted)
+        log_line("%s from %s", name, s->peer);
+    else
+        log_line("%s", name);
+}
+
+static bool write_report(const uint8_t report[8]) {
+    // A failed write drops this report and the sender session; the USB session
+    // itself is never torn down at runtime (only initialization can end it).
+    static bool failing;
+    Result rc = usb_keyboard_write(report);
+    if (R_FAILED(rc) && !failing) {
+        failing = true;
+        log_line("report writes failing: %08x", rc);
+    } else if (R_SUCCEEDED(rc)) {
+        failing = false;
+    }
+    return R_SUCCEEDED(rc);
+}
 
 int main(void) {
     consoleInit(NULL);
@@ -43,7 +107,12 @@ int main(void) {
     rc = usb_keyboard_init();
     if (R_FAILED(rc)) goto error;
     usb = true;
-    if (!server_init(&server, NXHID_PORT, write_report, usb_keyboard_leds)) {
+    log_file = fopen("sdmc:/switch/nxhid/nxhid.log", "w");
+    log_origin = milliseconds();
+    log_line("NXHID %s starting (HOS %u.%u.%u)", NXHID_VERSION,
+             (unsigned)HOSVER_MAJOR(hosversionGet()), (unsigned)HOSVER_MINOR(hosversionGet()),
+             (unsigned)HOSVER_MICRO(hosversionGet()));
+    if (!server_init(&server, NXHID_PORT, write_report, usb_keyboard_leds, on_server_event)) {
         snprintf(message, sizeof(message), "Cannot listen on TCP %d: %s", NXHID_PORT, strerror(errno));
         goto error;
     }
@@ -54,23 +123,35 @@ int main(void) {
         u64 down = padGetButtonsDown(&pad);
         if (down & HidNpadButton_Plus) break;
         if (down & HidNpadButton_B) {
+            log_line("sender dropped by user");
             server_drop(&server);
             snprintf(message, sizeof(message), "Sender disconnected. Waiting for a new connection.");
         }
         bool focused = appletGetFocusState() == AppletFocusState_InFocus;
-        if (R_SUCCEEDED(usb_fault)) usb_fault = usb_keyboard_tick();
-        bool ready = R_SUCCEEDED(usb_fault) && usb_keyboard_ready();
-        server_tick(&server, milliseconds(), ready && focused);
-        if (R_FAILED(usb_fault)) {
-            server_drop(&server);
-            snprintf(message, sizeof(message), "USB reset (%08x). Reconnect the sender once USB is ready.", usb_fault);
-            usb_keyboard_exit();
-            usb = false;
-            rc = usb_keyboard_init();
-            if (R_FAILED(rc)) goto error;
-            usb = true;
-            usb_fault = 0;
+        static bool was_focused = true;
+        if (focused != was_focused) {
+            was_focused = focused;
+            log_line("focus %s", focused ? "gained" : "lost");
         }
+        usb_keyboard_tick();
+        bool ready = usb_keyboard_ready();
+        if (ready != was_ready) {
+            was_ready = ready;
+            log_line("keyboard %s (usb %s)", ready ? "ready" : "lost", usb_state_name(usb_keyboard_state()));
+        }
+        if (ready && seen_resets != usb_keyboard_resets()) {
+            seen_resets = usb_keyboard_resets();
+            log_line("host reset the bus");
+            snprintf(message, sizeof(message), "Host reset the bus; keyboard re-ready.");
+        }
+        if (seen_errors != usb_keyboard_errors()) {
+            seen_errors = usb_keyboard_errors();
+            log_line("usb error %08x (usb %s)", usb_keyboard_last_error(), usb_state_name(usb_keyboard_state()));
+            // Superseded control transfers are expected host re-enumeration noise.
+            if (!ready)
+                snprintf(message, sizeof(message), "USB hiccup (%08x); continuing.", usb_keyboard_last_error());
+        }
+        server_tick(&server, milliseconds(), ready && focused);
         u64 now = milliseconds();
         if (focused && now >= next_draw) {
             next_draw = now + 250;
@@ -78,12 +159,15 @@ int main(void) {
             char address[32] = "Wi-Fi not connected";
             if (R_SUCCEEDED(nifmGetCurrentIpAddress(&ip)) && ip)
                 inet_ntop(AF_INET, &ip, address, sizeof(address));
-            printf("\x1b[2J\x1b[HNXHID - Wi-Fi to USB keyboard\n\n");
+            printf("\x1b[2J\x1b[HNXHID %s - Wi-Fi to USB keyboard\n\n", NXHID_VERSION);
             printf("Switch IP:  %s\nTCP port:   %d\n\n", address, NXHID_PORT);
             printf("USB:        %s\nSender:     %s\nReports:    %lu\n", ready ? "Keyboard ready" : "Waiting for USB host", server.client >= 0 ? server.peer : "Waiting", server.reports);
+            printf("Resets:     %lu   Hiccups: %lu (last %08x)\n\n", usb_keyboard_resets(), usb_keyboard_errors(), usb_keyboard_last_error());
             u8 leds = usb_keyboard_leds();
             printf("Host LEDs:  Num %s  Caps %s  Scroll %s\n\n", leds & 1 ? "on" : "off", leds & 2 ? "on" : "off", leds & 4 ? "on" : "off");
             printf("B: disconnect sender    +: exit\n\n%s\n\n", message);
+            printf("Event: %s\n", last_event);
+            printf("Log: sdmc:/switch/nxhid/nxhid.log\n");
             printf("Computer -> Wi-Fi -> Switch -> USB -> target device\n");
             consoleUpdate(NULL);
         }
@@ -100,10 +184,12 @@ error:
         consoleUpdate(NULL);
     }
 cleanup:
+    log_line("exiting");
     server_close(&server);
     if (usb) usb_keyboard_exit();
     if (network) nifmExit();
     if (sockets) socketExit();
+    if (log_file) fclose(log_file);
     appletSetAutoSleepDisabled(false);
     consoleExit(NULL);
     return 0;

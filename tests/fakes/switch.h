@@ -14,7 +14,7 @@ typedef u32 Result;
 #define MAKERESULT(module, error) ((Result)((module) * 100 + (error)))
 #define KERNELRESULT(error) MAKERESULT(1, error)
 enum { Module_Libnx = 2, LibnxError_IoError = 1, LibnxError_IncompatSysVer,
-       LibnxError_NotInitialized, TimedOut = 10 };
+       LibnxError_NotInitialized, TimedOut = 10, InvalidState };
 enum { USB_DT_DEVICE_SIZE = 18, USB_DT_INTERFACE_SIZE = 9, USB_DT_ENDPOINT_SIZE = 7 };
 enum { USB_DT_DEVICE = 1, USB_DT_INTERFACE = 4, USB_DT_ENDPOINT = 5,
        USB_DT_BOS = 15, USB_DT_DEVICE_CAPABILITY = 16, USB_DT_HID = 33,
@@ -23,7 +23,7 @@ enum { USB_CLASS_HID = 3, USB_TRANSFER_TYPE_INTERRUPT = 3 };
 enum { USB_REQUEST_GET_STATUS = 0, USB_REQUEST_GET_DESCRIPTOR = 6,
        USB_REQUEST_GET_INTERFACE = 10, USB_REQUEST_SET_INTERFACE = 11 };
 typedef enum { UsbDeviceSpeed_Full = 2, UsbDeviceSpeed_High, UsbDeviceSpeed_Super } UsbDeviceSpeed;
-typedef enum { UsbState_Detached, UsbState_Configured = 5 } UsbState;
+typedef enum { UsbState_Detached, UsbState_Configured = 5, UsbState_Suspended = 6 } UsbState;
 typedef struct { bool signaled; Result error; } Event;
 typedef struct {
     u8 interface_index;
@@ -81,4 +81,5 @@ Result usbDsParseReportData(UsbDsReportData *reports, u32 id, u32 *requested, u3
 Result usbDsInterface_StallCtrl(UsbDsInterface *intf);
 Result usbDsInterface_GetSetupPacket(UsbDsInterface *intf, void *data, size_t size);
 Result usbDsEndpoint_PostBufferAsync(UsbDsEndpoint *ep, void *data, size_t size, u32 *id);
+Result usbDsEndpoint_Cancel(UsbDsEndpoint *ep);
 Result usbDsEndpoint_GetReportData(UsbDsEndpoint *ep, UsbDsReportData *reports);

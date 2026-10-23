@@ -14,6 +14,7 @@ static bool nonblock(int fd) {
 }
 
 static bool would_block(void) { return errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR; }
+static void emit(const Server *s, ServerEvent event) { if (s->log) s->log((Server *)s, event); }
 
 void server_drop(Server *s) {
     bool release = s->client >= 0;
@@ -21,6 +22,8 @@ void server_drop(Server *s) {
     s->client = -1;
     s->used = s->output_size = s->output_sent = 0;
     s->peer[0] = 0;
+    s->pending = false;
+    s->disabled_since = 0;
     if (release) s->write_report((const uint8_t[8]){0});
 }
 
@@ -30,8 +33,8 @@ void server_close(Server *s) {
     s->listener = -1;
 }
 
-bool server_init(Server *s, uint16_t port, ReportWriter writer, LedReader reader) {
-    *s = (Server){.listener = -1, .client = -1, .write_report = writer, .read_leds = reader};
+bool server_init(Server *s, uint16_t port, ReportWriter writer, LedReader reader, ServerLogger logger) {
+    *s = (Server){.listener = -1, .client = -1, .write_report = writer, .read_leds = reader, .log = logger};
     s->listener = socket(AF_INET, SOCK_STREAM, 0);
     if (s->listener < 0) return false;
     int yes = 1;
@@ -62,11 +65,21 @@ static void command(Server *s, uint64_t now) {
         char response[16];
         snprintf(response, sizeof(response), "LEDS %02x\n", s->read_leds() & 0x1f);
         reply(s, response);
-    } else if (c.type == CMD_REPORT && s->write_report(c.report)) {
-        s->reports++;
-        reply(s, "OK\n");
+    } else if (c.type == CMD_REPORT) {
+        if (s->write_report(c.report)) {
+            s->reports++;
+            reply(s, "OK\n");
+            emit(s, ServerEventReportSent);
+        } else {
+            // Delivery failed mid-report (host reset blink): hold the report
+            // for retry from server_tick instead of killing the session.
+            memcpy(s->pending_report, c.report, 8);
+            s->pending = true;
+            s->pending_since = now;
+            emit(s, ServerEventReportHeld);
+        }
     } else {
-        // Invalid input or failed USB delivery invalidates the whole session.
+        // Invalid input invalidates the whole session.
         server_drop(s);
         return;
     }
@@ -78,7 +91,12 @@ void server_tick(Server *s, uint64_t now, bool enabled) {
     socklen_t size = sizeof(addr);
     int incoming = accept(s->listener, (struct sockaddr *)&addr, &size);
     if (incoming >= 0) {
-        if (!enabled || s->client >= 0 || !nonblock(incoming)) close(incoming);
+        // Accept even while paused: the sender's first command waits out the
+        // USB blink in the socket buffer instead of meeting a closed socket.
+        if (s->client >= 0 || !nonblock(incoming)) {
+            close(incoming);
+            if (s->client >= 0) emit(s, ServerEventRejected);
+        }
         else {
             int yes = 1;
             setsockopt(incoming, IPPROTO_TCP, TCP_NODELAY, &yes, sizeof(yes));
@@ -88,10 +106,41 @@ void server_tick(Server *s, uint64_t now, bool enabled) {
             s->client = incoming;
             s->last_activity = now;
             inet_ntop(AF_INET, &addr.sin_addr, s->peer, sizeof(s->peer));
+            emit(s, ServerEventAccepted);
         }
     }
     if (s->client < 0) return;
-    if (!enabled || now - s->last_activity >= NXHID_TIMEOUT_MS) { server_drop(s); return; }
+    if (!enabled) {
+        // A USB or focus blink pauses the sender rather than dropping it.
+        if (!s->disabled_since) s->disabled_since = now;
+        if (now - s->disabled_since > NXHID_PAUSE_MS) {
+            emit(s, ServerEventDropPause);
+            server_drop(s);
+        }
+        else if (s->pending) s->pending_since = now; // Retry window restarts on resume.
+        return;
+    }
+    s->disabled_since = 0;
+    if (s->pending) {
+        if (now - s->pending_since > NXHID_RETRY_MS) {
+            emit(s, ServerEventDropRetry);
+            server_drop(s);
+            return;
+        }
+        if (s->write_report(s->pending_report)) {
+            s->pending = false;
+            s->reports++;
+            reply(s, "OK\n");
+            s->last_activity = now;
+            emit(s, ServerEventReportSent);
+        }
+        return;
+    }
+    if (now - s->last_activity >= NXHID_TIMEOUT_MS) {
+        emit(s, ServerEventDropIdle);
+        server_drop(s);
+        return;
+    }
     if (s->output_sent < s->output_size) {
 #ifdef MSG_NOSIGNAL
         const int flags = MSG_NOSIGNAL;
@@ -100,7 +149,10 @@ void server_tick(Server *s, uint64_t now, bool enabled) {
 #endif
         ssize_t n = send(s->client, s->output + s->output_sent, s->output_size - s->output_sent, flags);
         if (n > 0) s->output_sent += (size_t)n;
-        else if (n == 0 || !would_block()) server_drop(s);
+        else if (n == 0 || !would_block()) {
+            emit(s, ServerEventDropSend);
+            server_drop(s);
+        }
         return;
     }
     // Read at most one bounded line per tick, preserving TCP stream framing.
@@ -108,9 +160,17 @@ void server_tick(Server *s, uint64_t now, bool enabled) {
         char ch;
         ssize_t n = recv(s->client, &ch, 1, 0);
         if (n < 0 && would_block()) return;
-        if (n <= 0) { server_drop(s); return; }
+        if (n <= 0) {
+            emit(s, ServerEventDropPeer);
+            server_drop(s);
+            return;
+        }
         if (ch == '\n') { command(s, now); return; }
-        if (ch < 32 || ch > 126 || s->used == sizeof(s->line) - 1) { server_drop(s); return; }
+        if (ch < 32 || ch > 126 || s->used == sizeof(s->line) - 1) {
+            emit(s, ServerEventDropInvalid);
+            server_drop(s);
+            return;
+        }
         s->line[s->used++] = ch;
     }
 }

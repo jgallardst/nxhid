@@ -16,6 +16,13 @@ PORT = 24872
 RELEASE = bytes(8)
 HEARTBEAT_INTERVAL = 0.5
 SEQUENCE_HOLD = 0.05
+DEBUG = bool(os.environ.get("NXHID_DEBUG"))
+_STARTED = time.monotonic()
+
+
+def debug(message):
+    if DEBUG:
+        print(f"[{time.monotonic() - _STARTED:8.3f}] {message}", file=sys.stderr)
 MODIFIERS = {
     "ctrl": 1, "control": 1, "ctrl_l": 1, "control_l": 1,
     "shift": 2, "shift_l": 2, "alt": 4, "alt_l": 4,
@@ -127,10 +134,12 @@ class Client:
 
     def __enter__(self):
         try:
+            debug(f"connecting to {self.host}:{self.port} (timeout {self.timeout}s)")
             self.sock = socket.create_connection((self.host, self.port), self.timeout)
             self.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
             self.reader = self.sock.makefile("rb")
             self.request("PING")
+            debug("connected; PING acknowledged")
             return self
         except BaseException:
             self.close()
@@ -138,12 +147,16 @@ class Client:
 
     def exchange(self, line):
         try:
+            debug(f"> {line}")
+            started = time.monotonic()
             self.sock.sendall((line + "\n").encode("ascii"))
             response = self.reader.readline(128)
+            debug(f"< {response!r} in {time.monotonic() - started:.3f}s")
             if not response.endswith(b"\n"):
                 raise ConnectionError("Switch closed the session or sent an incomplete response")
             return response
-        except OSError:
+        except OSError as exc:
+            debug(f"! {exc!r}")
             # A timed-out buffered reader cannot be reused. Closing the socket
             # also lets the server release keys instead of waiting for its watchdog.
             self.close()
@@ -171,6 +184,7 @@ class Client:
         self.request("REPORT " + report.hex())
 
     def close(self):
+        debug("connection closed")
         reader, sock = self.reader, self.sock
         self.reader = self.sock = None
         try:
@@ -446,9 +460,12 @@ def live(host, port):
 
 
 def main(argv=None):
+    global DEBUG
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("host", help="Switch Wi-Fi IPv4 address shown in NXHID")
     parser.add_argument("--port", type=int, default=PORT)
+    parser.add_argument("--debug", action="store_true",
+                        help="Trace commands, replies, and timing to stderr (or set NXHID_DEBUG=1)")
     commands = parser.add_subparsers(dest="command", required=True)
     text = commands.add_parser("text", help="Type US-layout ASCII text")
     text.add_argument("value", nargs="?", help="Text to send; streams stdin as it arrives when omitted without --file")
@@ -462,6 +479,8 @@ def main(argv=None):
     commands.add_parser("live", help="Forward keys typed into a focused desktop window (requires Tk)")
     commands.add_parser("release", help="Release all keys")
     args = parser.parse_args(argv)
+    if args.debug:
+        DEBUG = True
     if not 1 <= args.port <= 65535:
         parser.error("port must be between 1 and 65535")
     try:

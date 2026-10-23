@@ -177,7 +177,8 @@ class ServerIntegrationTests(unittest.TestCase):
         cls.addClassCleanup(cls.build.cleanup)
         cls.executable = Path(cls.build.name) / "server"
         subprocess.run(["cc", "-std=c11", "-Wall", "-Wextra", "-Werror",
-                        "-D_POSIX_C_SOURCE=200809L", "-I" + str(ROOT / "include"),
+                        "-D_POSIX_C_SOURCE=200809L", "-DNXHID_RETRY_MS=300",
+                        "-I" + str(ROOT / "include"),
                         str(ROOT / "source/server.c"), str(ROOT / "source/protocol.c"),
                         str(ROOT / "tests/server_harness.c"), "-o", str(cls.executable)], check=True)
 
@@ -190,11 +191,16 @@ class ServerIntegrationTests(unittest.TestCase):
         self.log = Path(self.temp.name) / "reports.txt"
         self.leds_file = Path(self.temp.name) / "leds.txt"
         self.leds_file.write_text("0")
+        self.fail_file = Path(self.temp.name) / "usb_down"
+        self.pause_file = Path(self.temp.name) / "paused"
         self.start()
 
     def start(self, fail=False):
+        if fail:
+            self.fail_file.write_text("down")
         self.process = subprocess.Popen([str(self.executable), str(self.log),
-                                         "fail" if fail else "ok", str(self.leds_file)],
+                                         str(self.leds_file), str(self.fail_file),
+                                         str(self.pause_file)],
                                         stdout=subprocess.PIPE, text=True)
         line = self.process.stdout.readline()
         self.assertTrue(line, "Native server did not start")
@@ -525,8 +531,45 @@ class ServerIntegrationTests(unittest.TestCase):
         self.start(fail=True)
         sock = self.connect()
         sock.sendall(b"REPORT 0000040000000000\n")
-        self.assertEqual(self.line(sock), b"")
-        self.assertEqual(self.reports(2)[-1], "0000000000000000")
+        self.assertEqual(self.line(sock), b"")  # Retry window exhausted; dropped.
+        # The undelivered key never reached the keyboard; only the release did.
+        self.assertEqual(self.reports(1), ["0000000000000000"])
+
+    def test_brief_usb_failure_retries_report(self):
+        with nxhid.Client("127.0.0.1", self.port, timeout=4) as client:
+            self.fail_file.write_text("down")
+            client.sock.sendall(b"REPORT 0200040000000000\n")
+            time.sleep(0.15)  # Inside the retry window.
+            self.fail_file.unlink()  # USB recovers; the held report delivers.
+            self.assertEqual(self.line(client.sock), b"OK\n")
+        self.assertEqual(self.reports(2), ["0200040000000000", "0000000000000000"])
+
+    def test_pause_extends_report_retry_window(self):
+        with nxhid.Client("127.0.0.1", self.port, timeout=4) as client:
+            self.fail_file.write_text("down")
+            client.sock.sendall(b"REPORT 0200040000000000\n")
+            time.sleep(0.1)  # The report is read and held for retry.
+            self.pause_file.write_text("down")
+            time.sleep(0.6)  # Longer than the retry window, but USB is paused.
+            self.fail_file.unlink()
+            self.pause_file.unlink()
+            self.assertEqual(self.line(client.sock), b"OK\n")
+        self.assertEqual(self.reports(2), ["0200040000000000", "0000000000000000"])
+
+    def test_usb_blink_pauses_session_instead_of_dropping(self):
+        self.pause_file.write_text("down")
+        sock = socket.create_connection(("127.0.0.1", self.port), timeout=4)
+        self.sockets.append(sock)
+        sock.sendall(b"PING\n")  # Accepted while paused; waits out the blink.
+        time.sleep(0.3)
+        self.pause_file.unlink()
+        self.assertEqual(self.line(sock), b"OK\n")
+        sock.sendall(b"REPORT 0200040000000000\n")
+        self.assertEqual(self.line(sock), b"OK\n")
+        sock.sendall(b"RELEASE\n")
+        self.assertEqual(self.line(sock), b"OK\n")
+        sock.close()
+        self.assertEqual(self.reports(2), ["0200040000000000", "0000000000000000"])
 
 
 if __name__ == "__main__":

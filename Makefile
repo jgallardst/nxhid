@@ -5,7 +5,7 @@ TARGET := nxhid
 BUILD := build
 APP_TITLE := NXHID Wi-Fi Keyboard
 APP_AUTHOR := NXHID
-APP_VERSION := 0.1.0
+APP_VERSION := 0.3.1
 PYTHON ?= python3
 
 .PHONY: test clean
@@ -21,7 +21,8 @@ TOPDIR ?= $(CURDIR)
 include $(DEVKITPRO)/libnx/switch_rules
 
 ARCH := -march=armv8-a+crc+crypto -mtune=cortex-a57 -mtp=soft -fPIE
-CFLAGS := -g -O2 -Wall -Wextra -Werror -std=gnu11 -ffunction-sections $(ARCH) $(INCLUDE) -D__SWITCH__
+CFLAGS := -g -O2 -Wall -Wextra -Werror -std=gnu11 -ffunction-sections $(ARCH) $(INCLUDE) -D__SWITCH__ \
+	-DNXHID_VERSION=\"$(APP_VERSION)\"
 LDFLAGS = -specs=$(DEVKITPRO)/libnx/switch.specs -g $(ARCH) -Wl,-Map,$(notdir $*.map)
 LIBS := -lnx
 
